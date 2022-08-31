@@ -1,0 +1,383 @@
+---
+title: "Two-Factor Analysis - Duo vs DE"
+author: "Amy Hung"
+date: "Last compiled on `r format(Sys.time(), '%d %B %Y')`"
+
+output:
+  rmdformats::robobook:
+    thumbnails: true
+    lightbox: true
+    gallery: true
+    code_folding: show
+---
+
+```{r setup, include=FALSE, message = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir="~/Desktop/NEW_ChROseq_HIO/miRNA_effect_2021/two_factor_miR/")
+```
+
+## Project description
+
+ChRO-seq and small RNA-seq were performed with human iPSC-derived DE and Duo spheroids. Below is the script for DESeq2 Two-factor analysis assessing post-transcriptional regulation of microRNAs in Duo relevant to DE.
+
+## Load required libraries
+
+```{r load-libraries, message = FALSE, warning= FALSE, error=FALSE}
+library(DESeq2)
+library(dplyr)
+library(ggrepel)
+library(tidyr) 
+library(stringr) 
+library(textshape)
+library(ggpubr)
+```
+
+## Get ChRO-seq reads for annotated miRs
+
+To assess transcriptional activity of miRs, we extracted ChRO-seq counts from the flanking regions (+/- 5 kb window) of annotated miR using reference `gencode.v33.annotation.gtf`. In addition, I excluded TRE counts (TREs present in either Duo or DE) from these flanking regions to eliminate the bias from these TREs. Since step requires path to ChRO-seq biwig files and package `bigwig` to extract counts, this part was done using a Cornell bioHPC compute node and `R3.5.0` environment.
+
+```{r get-ChRO-count, eval= F}
+## read in gtf bed file
+# the alternate gene_coord file 
+gene_coord <- read.delim("/home/pr46_0001/ChROseq/2019_08_HIO_merged/ChRO_RNA_joint/genecoordinates_v33_start0_no.DuovsDE.TRE.bed", header = FALSE, stringsAsFactors = FALSE)
+
+# extract miRNA info
+miR_coord <- gene_coord %>%
+  separate(col = V4, into = c("geneName", 'GENEID', 'type'), sep = "\\|", remove = TRUE) %>%
+  filter(type=="miRNA")
+
+# number of miR
+nrow(miR_coord) #1766
+
+# adding customized flanking region to the miR coordinates.  5 kb down and upstream.
+miR_coord <- miR_coord %>%
+  mutate(V7=V2-5000) %>%
+  mutate(V8=V3+5000) %>%
+  mutate(size=abs(V7-V8)) %>%
+  dplyr::select(-V2, -V3, -V5) %>%
+  mutate(V4 = paste(geneName, GENEID, type, sep = "|")) %>%
+  dplyr::select(V1, V7, V8, V4, size, V6)
+
+
+## create function to get counts from plus and minus strand bigwig files
+getStrandedCountsGenes <- function(plus, minus, intervals, path = "") {
+  plus.intervals <- intervals[intervals[,6] == "+",]
+  minus.intervals <- intervals[intervals[,6] == "-",]
+  pl <- load.bigWig(paste(path, plus, sep = ""))
+  mn <- load.bigWig(paste(path, minus, sep = ""))
+  counts.plus <- bed.region.bpQuery.bigWig(pl, plus.intervals, abs.value = TRUE)
+  counts.minus <- bed.region.bpQuery.bigWig(mn, minus.intervals, abs.value = TRUE)
+  counts <- c(counts.plus, counts.minus)
+}
+
+## read in all single sample TRE files
+# get bw files
+ChRO_path = ("/home/pr46_0001/ChROseq/2019_08_HIO_merged/HIO_DuovsDE2/")
+
+list_plus.bw <- list.files(ChRO_path, pattern = "_plus.bw$", full.names = F)
+list_minus.bw <- gsub("_plus.bw", "_minus.bw", list_plus.bw)
+plus.bw <- file.path(ChRO_path, list_plus.bw)
+minus.bw <- file.path(ChRO_path, list_minus.bw)
+all(file.exists(plus.bw))
+all(file.exists(minus.bw))
+
+# create sample name list, useful for later steps
+samples <- str_extract(list_plus.bw, "[D][E5S]{1,2}_[123456]") 
+samples
+
+## extract counts
+gene.counts <- cbind(mclapply(1:length(plus.bw), function(x) getStrandedCountsGenes(plus.bw[x], minus.bw[x], intervals = miR_coord), mc.cores = 23))
+gene.counts <- data.frame(sapply(gene.counts, c))
+names(gene.counts) <- sapply(samples, function(x) paste0("ChRO_", x))
+
+
+# sum the reads from the truncated regions of the same gene 
+gene.counts$genestring <- c(miR_coord$V4[miR_coord[,6] == "+"], miR_coord$V4[miR_coord[,6] == "-"]) 
+
+
+# sum the reads from the same entry miR name
+gene.counts <- gene.counts %>%
+  separate(col = genestring, into = c("geneName", 'ID', 'type'), sep = "\\|", remove = TRUE) %>%
+  dplyr::select(-ID, -type)
+
+gene.counts <- gene.counts %>% 
+  group_by(geneName) %>%
+  dplyr::summarise_all(sum) %>%
+  column_to_rownames(., "geneName") 
+
+
+## write raw counts
+write.table(gene.counts, "/home/yah6/2020_ChRO_HIO/TwoFactor_miR/DuovsDE_5kb_rawcount_2022.txt", quote = FALSE, sep = "\t", row.names = TRUE)
+```
+
+## Fix name functions
+
+Formats of miR name in ChRO-seq and small RNA-seq are different, which creates troubles when merging these two datasets in later steps. For example, smRNA-seq output has miR isoform annotations (e.g., miR-X-3p_+_1) whereas ChRO-seq doesn't. I wrote two functions to "fix" names. 
+
+```{r fix-name}
+
+## Fix-name function for small RNA-seq 
+smRNA_fix_name <- function(mir) {
+  # Eg: hsa-mir-24-2-3p_-_1 -> miR-24-2
+  
+  mir2 <- str_replace_all(mir, 'hsa-', '') # remove species 
+  mir3 <- str_replace_all(mir2, 'mir', 'miR') # reformat mir to miR
+  mir4 <- str_replace_all(mir3, '-3p', '') # remove arm annotation
+  mir5 <- str_replace_all(mir4, '-5p', '') # remove arm annotation
+  mir6 <- str_extract(mir5, "[letmiR-]{4}[0-9]{1,4}[a-z]{0,1}[-]{0,1}[1-9]{0,1}") # remove isoforms
+  return(mir6)
+}
+
+## Fix-name function for ChRO-seq
+ChRO_fix_name <- function(mir) {
+  # Eg: MIR125B1 -> miR-125b-1
+  
+  mir2 <- tolower(mir) #lowercase
+  mir3 <- str_replace_all(mir2, 'hsa-mir-', 'miR-') # remove species 
+  mir4 <- str_replace_all(mir3, 'mir', 'miR-') # reformat mir to miR
+  mir5 <- str_replace_all(mir4, 'miR-let', 'let-')
+
+  if (!is.na(str_detect(mir5, str_extract(mir5, "[a-z]{1}[1-9]{1}")))) {
+    mir5 = paste(substr(mir5, 1, nchar(mir5)-1), substr(mir5, nchar(mir5), nchar(mir5)), sep = '-')
+  }
+  
+  return(mir5)
+}
+```
+
+## ChRO-seq DE analysis for miR
+
+I performed DESeq2 analysis for ChRO-seq samples to see how robust the DESeq2 analysis was for differentiating AKP and AK mutation signatures. 
+
+```{r ChROseq}
+## Load count table
+rc <- read.table("DuovsDE_5kb_rawcount_2022.txt")
+head(rc)
+
+## Load sample condition file
+samples = read.csv("samples_ChRO.csv", header = TRUE, stringsAsFactors=FALSE, row.names = "sample")
+
+## Select condition of interest
+samples <- samples %>% filter(condition == "DE" | condition == "Duo")
+rc <- rc[which(names(rc) %in% as.vector(row.names(samples)))]
+
+## Make sure sample names are in the same order in sample and count table files
+all(rownames(samples) %in% colnames(rc))
+all(rownames(samples) == colnames(rc))
+ChRO.cts <- as.data.frame.matrix( rc[, rownames(samples)] )
+all(rownames(samples) == colnames(rc))
+
+## Create colData for DESeq2 analysis
+ChRO.colData <- data.frame(name= names(ChRO.cts), condition = c(rep("Duo", 3), rep("DE", 4)), assay = "ChRO")
+
+## Create a DEseqDataSet from count table 
+dds <- DESeqDataSetFromMatrix(countData = ChRO.cts,
+                              colData = ChRO.colData,
+                              design = ~ condition)
+
+## DESeq = fx to calculate DE
+dds <- DESeq(dds)
+
+## Write normalized counts to file
+normalized.counts <- as.data.frame(counts(dds, normalized=TRUE ))
+head(normalized.counts)
+write.csv(normalized.counts, file = 'ChROseq_5kb_normalized_counts_Duo_vs_DE.csv', quote = FALSE, row.names = TRUE)
+
+## Make comparison between conditions
+res <- results( dds, contrast = c("condition", "Duo", "DE") )
+head(res)
+
+## Check number of differentially expressed miRs
+nrow(res[which(res$padj < 0.2 & res$pvalue < 0.05 & res$log2FoldChange > 0 & res$baseMean > 100),]) # UP
+nrow(res[which(res$padj < 0.2 & res$pvalue < 0.05 & res$log2FoldChange < -0 & res$baseMean > 100),]) # DOWN 
+
+## Add "full name (miR)" and "short name (miR_ver2)" column
+## "short name" is for ChROseq + smRNAseq integrative analysis
+ChRO.res <- as.data.frame(res) %>%
+  mutate(miR = row.names(res)) %>%
+  select(miR, everything()) 
+
+ChRO.res <- ChRO.res %>% mutate(miR_ver2 = apply(ChRO.res, 1, function(x) {ChRO_fix_name(x[1])} ))
+
+## write DESeq output file
+write.csv(ChRO.res, file="ChROseq_5kb_DESeq2_Duo_vs_DE.csv", quote=F, row.names = F)
+
+```
+
+## smRNA-seq DE analysis 
+
+I performed DESeq2 analysis for smRNA-seq samples to see how robust the DESeq2 analysis was for differentiating AKP and AK mutation signatures. 
+
+```{r smRNAseq}
+## Load count table
+rc = read.csv("raw_miR_counts.csv", header = TRUE, stringsAsFactors=FALSE, row.names = "miR")
+rc <- round(rc)
+head(rc)
+
+## Load sample spreadsheet
+samples = read.csv("samples_smRNA.csv", header = TRUE, stringsAsFactors=FALSE, row.names = "sample")
+
+## select condition of interest
+samples <- samples %>% filter(condition == "DE" | condition == "Duo")
+rc <- rc[which(names(rc) %in% as.vector(row.names(samples)))]
+
+## make sure sample names are in the same order in sample and count table files
+all(rownames(samples) %in% colnames(rc))
+all(rownames(samples) == colnames(rc))
+smRNA.cts <- as.data.frame.matrix( rc[, rownames(samples)] )
+all(rownames(samples) == colnames(rc))
+
+## create colData
+smRNA.colData <- data.frame(name= names(smRNA.cts), condition = c(rep("DE", 3), rep("Duo", 6)), assay = "smRNA")
+
+## Create a DEseqDataSet from count table 
+dds <- DESeqDataSetFromMatrix(countData = smRNA.cts,
+                              colData = smRNA.colData,
+                              design = ~ condition)
+
+## DESeq = fx to calculate DE
+dds <- DESeq(dds)
+
+## Write normalized counts to file
+normalized.counts <- as.data.frame(counts(dds, normalized=TRUE ))
+head(normalized.counts)
+write.csv(normalized.counts, file = 'smRNAseq_normalized_counts_Duo_vs_DE.csv', quote = FALSE, row.names = TRUE)
+
+## Make comparison between conditions
+res <- results( dds, contrast = c("condition", "Duo", "DE") )
+head(res)
+
+## Check number of differentially expressed miRs
+nrow(res[which(res$padj < 0.2 & res$pvalue < 0.05 & res$log2FoldChange > 0 & res$baseMean > 100),]) # UP 
+nrow(res[which(res$padj < 0.2 & res$pvalue < 0.05 & res$log2FoldChange < -0 & res$baseMean > 100),]) # DOWN 
+
+## Add miR "full name" and "short name" column
+## "short name" is for ChROseq + smRNAseq integrative analysis
+smRNA.res <- as.data.frame(res) %>%
+  mutate(miR = row.names(res)) %>%
+  select(miR, everything()) 
+
+smRNA.res <- smRNA.res %>% mutate(miR_ver2 = apply(smRNA.res, 1, function(x) {smRNA_fix_name(x[1])} ))
+
+## write DESeq output file
+write.csv(smRNA.res, file="smRNAseq_DESeq2_Duo_vs_DE.csv", quote=F, row.names = F)
+
+```
+
+## Correlation analysis
+ChRO-seq and smRNA-seq should behave in parallele genome wide.  As part of QC, I performed correlation analysis for ChRO-seq and smRNA-seq using `baseMean` or `log2FoldChange` info.  Based on past experience, correlation analysis bsed on `log2FoldChange` is better at depicting the positive correlation.  
+
+```{r correlation}
+## Depending on the sequencing coverage, sometimes ChRO-seq reads could be sparse. I applied a filtering based on baseMean ## to elminate noices in the dataset.  
+ChRO.res.ver2 <- ChRO.res %>% filter(baseMean > 10) %>% select(miR, miR_ver2, baseMean, log2FoldChange)
+smRNA.res.ver2 <- smRNA.res %>% filter(baseMean > 10) %>% select(miR, miR_ver2, baseMean, log2FoldChange)
+
+## Merge ChRO-seq and smRNA-seq count tables 
+## This gives a merged dataset including miRs that are present in both smRNA and ChROseq datasets
+merged.res <- merge(ChRO.res.ver2, smRNA.res.ver2, by.x = "miR_ver2", by.y = "miR_ver2", all.x = F, all.y = F)
+
+## Correlation: baseMean version
+## x-axis is ChRO-seq data and y-axis is smRNA-seq data
+ggscatter(merged.res, x = "baseMean.x", y = "baseMean.y",
+          color = "black", shape = 21, size = 3, # Points color, shape and size
+          add = "reg.line",  # Add regressin line
+          add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+          conf.int = TRUE, # Add confidence interval
+          cor.coef = TRUE, # Add correlation coefficient. 
+          cor.coeff.args = list(method = "pearson", label.x = -6, label.sep = "\n")
+)
+
+## Correlation: foldChange version
+## x-axis is ChRO-seq data and y-axis is smRNA-seq data
+ggscatter(merged.res, x = "log2FoldChange.x", y = "log2FoldChange.y",
+          color = "black", shape = 21, size = 3, # Points color, shape and size
+          add = "reg.line",  # Add regressin line
+          add.params = list(color = "blue", fill = "lightgray"), # Customize reg. line
+          conf.int = TRUE, # Add confidence interval
+          cor.coef = TRUE, # Add correlation coefficient. 
+          cor.coeff.args = list(method = "pearson", label.x = -6, label.sep = "\n")
+)
+```
+
+## Two-factor Analysis
+
+```{r two-factor}
+## Formatting ChRO-seq count table
+ChRO.cts <- as.data.frame(ChRO.cts) %>%
+  mutate(miR = row.names(ChRO.cts)) %>%
+  select(miR, everything()) 
+
+ChRO.cts <- ChRO.cts %>% mutate(miR_ver2 = apply(ChRO.cts, 1, function(x) {ChRO_fix_name(x[1])} ))
+
+## Formatting smRNA count table
+smRNA.cts <- as.data.frame(smRNA.cts) %>%
+  mutate(miR = row.names(smRNA.cts)) %>%
+  select(miR, everything()) 
+
+smRNA.cts <- smRNA.cts %>% mutate(miR_ver2 = apply(smRNA.cts, 1, function(x) {smRNA_fix_name(x[1])} ))
+
+## Merge counts tables (intersect)
+joint_cts <- merge(ChRO.cts, smRNA.cts, by.x= "miR_ver2", by.y = "miR_ver2", all.x=T, all.y = T) %>%
+  mutate(miRname = paste(miR_ver2, miR.x, miR.y, sep="|")) %>%
+  dplyr::select(-miR_ver2, -miR.x, -miR.y) %>%
+  column_to_rownames(., "miRname") 
+head(joint_cts)
+
+joint_cts <- joint_cts %>% drop_na()
+
+## Merge colData tables
+joint_colData <- rbind(ChRO.colData, smRNA.colData)
+
+## Run 2-factor analysis and get the DEseq matrix
+## Is the effect of "condition" (AKP vs AK mutation signature) different across different "assay types" (at the transcriptional level vs. steady state expression level)? This is the interaction term.
+dds <- DESeqDataSetFromMatrix(joint_cts, colData = joint_colData, design = ~ condition + assay + condition:assay)
+
+# Set reference level
+dds$condition
+dds$condition = relevel( dds$condition, "DE") # set DE as the reference group for factor "condition"
+
+dds$assay
+dds$assay = relevel( dds$assay, "ChRO") # set ChRO-seq as the refernece group for factor "assay"
+
+# Get DESeq matrix
+dds <- estimateSizeFactors(dds)
+dds <- DESeq(dds)
+
+# Check the contrast options that the DESeq can make 
+resultsNames(dds)
+
+## Extract result of comparison
+res <- as.data.frame(results(dds, name = "conditionDuo.assaysmRNA"))
+head(res)
+
+## separate miR name colum 
+res <- res %>% 
+  mutate(miR_full = row.names(.)) %>%
+  separate(col = miR_full, into = c("miR_ver2", 'ChROseq_miR', 'smRNA_miR'), sep = "\\|", remove = F)
+  
+## List of miRs with expression threshold 
+ChRO.bm100 <- ChRO.res[which(ChRO.res$baseMean > 100), ]
+smRNA.bm100 <- smRNA.res[which(smRNA.res$baseMean > 100), ]
+
+## Output files quick look 
+nrow(res[which( res$pvalue < 0.05 | res$padj < 0.2 ),]) # post-transcriptionally regulated 
+
+nrow(res[which( res$ChROseq_miR %in% ChRO.bm100$miR & res$smRNA_miR %in% smRNA.bm100$miR & res$pvalue < 0.05 & res$padj < 0.2 & res$log2FoldChange > 0),]) # post-transcriptionally stable 
+
+nrow(res[which( res$ChROseq_miR %in% ChRO.bm100$miR & res$smRNA_miR %in% smRNA.bm100$miR & res$pvalue < 0.05 & res$padj < 0.2 & res$log2FoldChange < 0),]) # post-transcriptionally unstable 
+
+Stable <- res[which( res$ChROseq_miR %in% ChRO.bm100$miR & res$smRNA_miR %in% smRNA.bm100$miR & res$pvalue < 0.05 & res$padj < 0.2 & res$log2FoldChange > 0),]
+
+Unstable <- res[which( res$ChROseq_miR %in% ChRO.bm100$miR & res$smRNA_miR %in% smRNA.bm100$miR & res$pvalue < 0.05 & res$padj < 0.2 & res$log2FoldChange < 0),]
+
+## Write 2-factor final output files 
+write.table(res, "TwoFactor_ChRO5kb_smRNAseq_Duo_vs_DE.txt", quote = FALSE, sep = "\t", row.names = F, col.names = T)
+```
+
+## Session info
+
+```{r session-info}
+
+sessionInfo()
+
+```
